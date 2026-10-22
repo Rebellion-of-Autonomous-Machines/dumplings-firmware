@@ -33,6 +33,7 @@ INPUT_GLOBAL_STATUS = 75
 INPUT_FILL_STATE = 76
 INPUT_DRAIN_STATE = 77
 INPUT_HEATER_STATE = 78
+INPUT_VALVE_LOCK_SECONDS = 79
 INPUT_DRIVE_BASE = 80
 REGS_PER_DRIVE = 5
 MODE_LOWER_BASE = 11
@@ -105,8 +106,11 @@ class App:
         self.lower_buttons = []
         self.raise_buttons = []
         self.raise_plain_buttons = []
+        self.valve_buttons = {}
+        self.command_buttons = []
 
         self._build_ui()
+        self._reset_runtime_ui()
         self._tick()
 
     def _build_ui(self):
@@ -173,12 +177,15 @@ class App:
                 pady=3,
             )
             self.timing_entries[str(var)] = entry
-        ttk.Button(
+        timing_write_button = ttk.Button(
             timing, text="Write timings", command=self.write_timings
-        ).grid(row=2, column=0, pady=(8, 0), sticky="w")
-        ttk.Button(
+        )
+        timing_write_button.grid(row=2, column=0, pady=(8, 0), sticky="w")
+        timing_save_button = ttk.Button(
             timing, text="Save to ESP32 memory", command=self.save_settings
-        ).grid(row=2, column=1, pady=(8, 0), sticky="w")
+        )
+        timing_save_button.grid(row=2, column=1, pady=(8, 0), sticky="w")
+        self.command_buttons.extend((timing_write_button, timing_save_button))
 
         valves_frame = ttk.LabelFrame(frm, text="Valves", padding=8)
         valves_frame.grid(
@@ -187,39 +194,52 @@ class App:
         ttk.Label(valves_frame, textvariable=self.valve_status_var).grid(
             row=0, column=0, columnspan=4, sticky="w"
         )
-        ttk.Button(
+        fill_close_button = ttk.Button(
             valves_frame,
-            text="Fill ON",
+            text="Fill CLOSE",
             command=lambda: self.set_valve(0, True),
-        ).grid(row=1, column=0, padx=(0, 4), pady=(8, 0))
-        ttk.Button(
+        )
+        fill_close_button.grid(row=1, column=0, padx=(0, 4), pady=(8, 0))
+        fill_open_button = ttk.Button(
             valves_frame,
-            text="Fill OFF",
+            text="Fill OPEN",
             command=lambda: self.set_valve(0, False),
-        ).grid(row=1, column=1, padx=4, pady=(8, 0))
-        ttk.Button(
+        )
+        fill_open_button.grid(row=1, column=1, padx=4, pady=(8, 0))
+        drain_close_button = ttk.Button(
             valves_frame,
-            text="Drain ON",
+            text="Drain CLOSE",
             command=lambda: self.set_valve(1, True),
-        ).grid(row=1, column=2, padx=4, pady=(8, 0))
-        ttk.Button(
+        )
+        drain_close_button.grid(row=1, column=2, padx=4, pady=(8, 0))
+        drain_open_button = ttk.Button(
             valves_frame,
-            text="Drain OFF",
+            text="Drain OPEN",
             command=lambda: self.set_valve(1, False),
-        ).grid(row=1, column=3, padx=4, pady=(8, 0))
+        )
+        drain_open_button.grid(row=1, column=3, padx=4, pady=(8, 0))
+        self.valve_buttons = {
+            (0, True): fill_close_button,
+            (0, False): fill_open_button,
+            (1, True): drain_close_button,
+            (1, False): drain_open_button,
+        }
         ttk.Label(valves_frame, textvariable=self.heater_status_var).grid(
             row=0, column=4, padx=(20, 0), sticky="w"
         )
-        ttk.Button(
+        heater_on_button = ttk.Button(
             valves_frame,
             text="Heater ON",
             command=lambda: self.set_heater(True),
-        ).grid(row=1, column=4, padx=(20, 4), pady=(8, 0))
-        ttk.Button(
+        )
+        heater_on_button.grid(row=1, column=4, padx=(20, 4), pady=(8, 0))
+        heater_off_button = ttk.Button(
             valves_frame,
             text="Heater OFF",
             command=lambda: self.set_heater(False),
-        ).grid(row=1, column=5, padx=4, pady=(8, 0))
+        )
+        heater_off_button.grid(row=1, column=5, padx=4, pady=(8, 0))
+        self.command_buttons.extend((heater_on_button, heater_off_button))
 
         drives_frame = ttk.LabelFrame(frm, text="Drives", padding=8)
         drives_frame.grid(
@@ -329,6 +349,10 @@ class App:
         self.values_var.set("-")
         self.valve_status_var.set("Fill=- Drain=-")
         self.heater_status_var.set("Heater=-")
+        for button in self.valve_buttons.values():
+            button.state(["disabled"])
+        for button in self.command_buttons:
+            button.state(["disabled"])
         for drive_index in range(DRIVE_COUNT):
             self.drive_status_vars[drive_index].set("-")
             self.lower_buttons[drive_index].state(["disabled"])
@@ -439,7 +463,7 @@ class App:
             (INPUT_RELAY_BASE, 16),
             (
                 INPUT_TEMPERATURE_X10,
-                INPUT_HEATER_STATE - INPUT_TEMPERATURE_X10 + 1,
+                INPUT_VALVE_LOCK_SECONDS - INPUT_TEMPERATURE_X10 + 1,
             ),
             (INPUT_DRIVE_BASE, DRIVE_COUNT * REGS_PER_DRIVE),
         ):
@@ -478,19 +502,40 @@ class App:
 
     def _update_from_registers(self, holding, inputs):
         global_status = inputs[INPUT_GLOBAL_STATUS]
+        startup_ready = not bool(global_status & (1 << 3))
         command_result = holding[REG_COMMAND_RESULT]
         temperature_raw = inputs[INPUT_TEMPERATURE_X10]
         dallas_count = inputs[INPUT_DALLAS_COUNT]
         fill_state = inputs[INPUT_FILL_STATE]
         drain_state = inputs[INPUT_DRAIN_STATE]
         heater_state = inputs[INPUT_HEATER_STATE]
+        valve_lock = inputs[INPUT_VALVE_LOCK_SECONDS]
+        fill_lock_seconds = valve_lock & 0xFF
+        drain_lock_seconds = valve_lock >> 8
         self.valve_status_var.set(
             f"Fill={VALVE_STATE_TEXT.get(fill_state, 'UNKNOWN')} "
-            f"Drain={VALVE_STATE_TEXT.get(drain_state, 'UNKNOWN')}"
+            f"({fill_lock_seconds}s) "
+            f"Drain={VALVE_STATE_TEXT.get(drain_state, 'UNKNOWN')} "
+            f"({drain_lock_seconds}s)"
         )
+        for valve_index, current_closed, remaining_seconds in (
+            (0, fill_state, fill_lock_seconds),
+            (1, drain_state, drain_lock_seconds),
+        ):
+            for requested_closed in (False, True):
+                allowed = (
+                    startup_ready
+                    and remaining_seconds == 0
+                    and int(requested_closed) != current_closed
+                )
+                self.valve_buttons[(valve_index, requested_closed)].state(
+                    ["!disabled"] if allowed else ["disabled"]
+                )
         self.heater_status_var.set(
             f"Heater={HEATER_STATE_TEXT.get(heater_state, 'UNKNOWN')}"
         )
+        for button in self.command_buttons:
+            button.state(["!disabled"] if startup_ready else ["disabled"])
         self._set_if_not_focused(
             self.lower_time_var, holding[REG_LOWER_TIME_MS]
         )
@@ -529,7 +574,7 @@ class App:
                 f"Remaining: {remaining_ms} ms\n"
                 f"UpRelay={int(up_relay)} DownRelay={int(down_relay)}"
             )
-            mode_ready = holding[REG_STAT_MODE] == 1
+            mode_ready = startup_ready and holding[REG_STAT_MODE] == 1
             self.lower_buttons[drive_index].state(
                 ["disabled"]
                 if not mode_ready or busy or bottom
@@ -556,7 +601,8 @@ class App:
             f"Uptime={inputs[INPUT_UPTIME_HOURS]} h "
             f"Protocol={holding[REG_PROTOCOL_VERSION]}\n"
             f"GlobalStatus=0x{global_status:04X} "
-            f"AnyBusy={int(bool(global_status & 1))}\n"
+            f"AnyBusy={int(bool(global_status & 1))} "
+            f"StartupReady={int(startup_ready)}\n"
             f"HeaterInterlockOK={int(bool(global_status & (1 << 1)))} "
             f"HeaterBlocked={int(bool(global_status & (1 << 2)))}\n"
             f"WaterLevelOK={inputs[INPUT_FLOAT_SENSOR]} "

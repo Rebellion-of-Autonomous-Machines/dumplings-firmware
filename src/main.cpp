@@ -25,6 +25,7 @@ static const uint8_t RELAY_CHANNEL_COUNT = 16;
 static const uint16_t RELAY_DEADTIME_MS = 120;
 static const uint8_t FILL_VALVE_CHANNEL = 9;
 static const uint8_t DRAIN_VALVE_CHANNEL = 10;
+static const uint32_t VALVE_LOCK_MS = 10000;
 static const uint8_t HEATER_PHASE_A_CHANNEL = 11;
 static const uint8_t HEATER_PHASE_B_CHANNEL = 12;
 static const uint8_t HEATER_PHASE_C_CHANNEL = 13;
@@ -108,6 +109,7 @@ enum ModbusInputReg : uint16_t {
   INPUT_FILL_STATE = 76,
   INPUT_DRAIN_STATE = 77,
   INPUT_HEATER_STATE = 78,
+  INPUT_VALVE_LOCK_SECONDS = 79,
   INPUT_DRIVE_BASE = 80
 };
 
@@ -173,6 +175,9 @@ bool floatSensorActive = false;
 uint8_t inputExpanderRaw = 0xFF;
 bool fillValveOn = false;
 bool drainValveOn = false;
+uint32_t valveChangedAtMs[2] = {0, 0};
+bool valveMotionStarted[2] = {false, false};
+bool startupInProgress = true;
 bool modbusReady = false;
 bool heaterOn = false;
 bool ethernetStarted = false;
@@ -456,19 +461,57 @@ void writeDriveRelays(uint8_t driveIndex, bool upOn, bool downOn) {
 }
 
 void setFillValve(bool enabled) {
+  bool changed = fillValveOn != enabled;
   fillValveOn = enabled;
   setRelayChannel(FILL_VALVE_CHANNEL, enabled);
   enforceHeaterInterlock();
   writeRelayOutputs();
+  if (changed) {
+    valveChangedAtMs[0] = millis();
+    valveMotionStarted[0] = true;
+  }
   syncValveModbusRegisters();
 }
 
 void setDrainValve(bool enabled) {
+  bool changed = drainValveOn != enabled;
   drainValveOn = enabled;
   setRelayChannel(DRAIN_VALVE_CHANNEL, enabled);
   enforceHeaterInterlock();
   writeRelayOutputs();
+  if (changed) {
+    valveChangedAtMs[1] = millis();
+    valveMotionStarted[1] = true;
+  }
   syncValveModbusRegisters();
+}
+
+uint32_t valveLockRemainingMs(uint8_t valveIndex) {
+  if (valveIndex >= 2 || !valveMotionStarted[valveIndex]) {
+    return 0;
+  }
+  uint32_t elapsedMs = millis() - valveChangedAtMs[valveIndex];
+  return elapsedMs >= VALVE_LOCK_MS ? 0 : VALVE_LOCK_MS - elapsedMs;
+}
+
+bool canChangeValve(uint8_t valveIndex, bool enabled) {
+  if (valveIndex >= 2) {
+    return false;
+  }
+  bool currentState = valveIndex == 0 ? fillValveOn : drainValveOn;
+  return enabled != currentState && valveLockRemainingMs(valveIndex) == 0;
+}
+
+bool requestValveState(uint8_t valveIndex, bool enabled) {
+  if (!canChangeValve(valveIndex, enabled)) {
+    return false;
+  }
+  if (valveIndex == 0) {
+    setFillValve(enabled);
+  } else {
+    setDrainValve(enabled);
+  }
+  return true;
 }
 
 uint16_t valveStatusBits() {
@@ -779,6 +822,9 @@ void syncModbusRegistersFromState() {
   if (!heaterInterlockOk()) {
     globalStatus |= (1U << 2);
   }
+  if (startupInProgress) {
+    globalStatus |= (1U << 3);
+  }
   uint16_t mode = 1;
   for (uint8_t driveIndex = 0; driveIndex < DRIVE_COUNT; driveIndex++) {
     LiftSequence sequence = drives[driveIndex].sequence;
@@ -828,6 +874,9 @@ void syncModbusRegistersFromState() {
   mb.Ireg(INPUT_FILL_STATE, fillValveOn ? 1 : 0);
   mb.Ireg(INPUT_DRAIN_STATE, drainValveOn ? 1 : 0);
   mb.Ireg(INPUT_HEATER_STATE, heaterOn ? 1 : (heaterInterlockOk() ? 0 : 2));
+  uint16_t fillLockSeconds = (valveLockRemainingMs(0) + 999) / 1000;
+  uint16_t drainLockSeconds = (valveLockRemainingMs(1) + 999) / 1000;
+  mb.Ireg(INPUT_VALVE_LOCK_SECONDS, fillLockSeconds | (drainLockSeconds << 8));
 
   for (uint8_t driveIndex = 0; driveIndex < DRIVE_COUNT; driveIndex++) {
     uint16_t base = INPUT_DRIVE_BASE + (driveIndex * 5);
@@ -840,16 +889,6 @@ void syncModbusRegistersFromState() {
 }
 
 void applyModbusWritableRegisters() {
-  uint16_t requestedValveControl = mb.Hreg(REG_VALVE_CONTROL);
-  bool requestedFillValveOn = (requestedValveControl & (1U << 0)) != 0;
-  bool requestedDrainValveOn = (requestedValveControl & (1U << 1)) != 0;
-  if (requestedFillValveOn != fillValveOn) {
-    setFillValve(requestedFillValveOn);
-  }
-  if (requestedDrainValveOn != drainValveOn) {
-    setDrainValve(requestedDrainValveOn);
-  }
-
   bool requestedHeaterOn = mb.Hreg(REG_HEATER_CONTROL) != 0;
   if (requestedHeaterOn && !heaterInterlockOk()) {
     mb.Hreg(REG_COMMAND_RESULT, CMD_RES_INVALID_ARG);
@@ -963,7 +1002,7 @@ bool readableInputRange(uint16_t address, uint16_t count) {
   return (address == INPUT_UPTIME_HOURS && end == 1) ||
          (address >= INPUT_END_BASE && end <= INPUT_END_BASE + DRIVE_COUNT * 2) ||
          (address >= INPUT_RELAY_BASE && end <= INPUT_RELAY_BASE + RELAY_CHANNEL_COUNT) ||
-         (address >= INPUT_TEMPERATURE_X10 && end <= INPUT_HEATER_STATE + 1) ||
+         (address >= INPUT_TEMPERATURE_X10 && end <= INPUT_VALVE_LOCK_SECONDS + 1) ||
          (address >= INPUT_DRIVE_BASE && end <= INPUT_DRIVE_BASE + DRIVE_COUNT * 5);
 }
 
@@ -983,6 +1022,9 @@ Modbus::ResultCode validateModbusRequest(Modbus::FunctionCode function, const Mo
   }
   if (function != Modbus::FC_WRITE_REG) {
     return Modbus::EX_ILLEGAL_FUNCTION;
+  }
+  if (startupInProgress) {
+    return Modbus::EX_SLAVE_DEVICE_BUSY;
   }
   uint16_t value = data.regCount;
   if (address >= 2 && address <= 6) {
@@ -1010,7 +1052,16 @@ Modbus::ResultCode validateModbusRequest(Modbus::FunctionCode function, const Mo
              ? Modbus::EX_SUCCESS : Modbus::EX_ILLEGAL_VALUE;
   }
   if (address == REG_VALVE_CONTROL) {
-    return value <= 3 ? Modbus::EX_SUCCESS : Modbus::EX_ILLEGAL_VALUE;
+    if (value > 3 || value == valveStatusBits()) {
+      return Modbus::EX_ILLEGAL_VALUE;
+    }
+    bool fillChanged = (value & 1U) != (fillValveOn ? 1U : 0U);
+    bool drainChanged = ((value >> 1) & 1U) != (drainValveOn ? 1U : 0U);
+    if ((fillChanged && valveLockRemainingMs(0) != 0) ||
+        (drainChanged && valveLockRemainingMs(1) != 0)) {
+      return Modbus::EX_ILLEGAL_VALUE;
+    }
+    return Modbus::EX_SUCCESS;
   }
   if (address == REG_HEATER_CONTROL) {
     return value <= 1 && (value == 0 || heaterInterlockOk()) ? Modbus::EX_SUCCESS : Modbus::EX_ILLEGAL_VALUE;
@@ -1028,7 +1079,17 @@ Modbus::ResultCode validateModbusRequest(Modbus::FunctionCode function, const Mo
 }
 
 Modbus::ResultCode onModbusRequestSuccess(Modbus::FunctionCode function, const Modbus::RequestData data) {
-  if (function == Modbus::FC_WRITE_REG && data.reg.address == REG_STAT_MODE) {
+  if (function == Modbus::FC_WRITE_REG && data.reg.address == REG_VALVE_CONTROL) {
+    uint16_t value = data.regCount;
+    bool fillRequested = (value & 1U) != 0;
+    bool drainRequested = (value & 2U) != 0;
+    if (fillRequested != fillValveOn) {
+      requestValveState(0, fillRequested);
+    }
+    if (drainRequested != drainValveOn) {
+      requestValveState(1, drainRequested);
+    }
+  } else if (function == Modbus::FC_WRITE_REG && data.reg.address == REG_STAT_MODE) {
     uint16_t value = data.regCount;
     uint8_t driveIndex = (value - 11) % DRIVE_COUNT;
     if (value <= 13) {
@@ -1074,6 +1135,7 @@ String driveJson(uint8_t driveIndex) {
 String statusJson() {
   String json = "{";
   json += "\"anyBusy\":" + String(anyDriveBusy() ? "true" : "false") + ",";
+  json += "\"startupReady\":" + String(startupInProgress ? "false" : "true") + ",";
   json += "\"ethernetStarted\":" + String(ethernetStarted ? "true" : "false") + ",";
   json += "\"ethernetLinkUp\":" + String(ETH.linkUp() ? "true" : "false") + ",";
   json += "\"ethernetIp\":\"" + ETH.localIP().toString() + "\",";
@@ -1086,6 +1148,8 @@ String statusJson() {
   json += "\"dallasDeviceCount\":" + String(dallasDeviceCount) + ",";
   json += "\"fillValveOn\":" + String(fillValveOn ? "true" : "false") + ",";
   json += "\"drainValveOn\":" + String(drainValveOn ? "true" : "false") + ",";
+  json += "\"fillValveLockSeconds\":" + String((valveLockRemainingMs(0) + 999) / 1000) + ",";
+  json += "\"drainValveLockSeconds\":" + String((valveLockRemainingMs(1) + 999) / 1000) + ",";
   json += "\"heaterOn\":" + String(heaterOn ? "true" : "false") + ",";
   json += "\"drives\":[";
   for (uint8_t i = 0; i < DRIVE_COUNT; i++) {
@@ -1208,6 +1272,9 @@ String generateHTML() {
 <body>
   <main>
     <h1>&#1055;&#1077;&#1083;&#1100;&#1084;&#1077;&#1085;&#1077;&#1074;&#1072;&#1088;&#1082;&#1072;</h1>
+    <div class="status">Режим: <b id="startup-status">)rawliteral";
+  html += startupInProgress ? "Инициализация" : "Готов";
+  html += R"rawliteral(</b></div>
     <div class="status">Ethernet: <b id="ethernet-link">)rawliteral";
   html += ETH.linkUp() ? "link up" : "link down";
   html += R"rawliteral(</b>, IP: <b id="ethernet-ip">)rawliteral";
@@ -1229,16 +1296,19 @@ String generateHTML() {
         <div class="status">&#1057;&#1086;&#1089;&#1090;&#1086;&#1103;&#1085;&#1080;&#1077;: <b id="fill-valve">)rawliteral";
   html += fillValveOn ? "closed" : "open";
   html += R"rawliteral(</b></div>
+        <div class="status">Ожидание перед переключением: <b id="fill-lock">)rawliteral";
+  html += String((valveLockRemainingMs(0) + 999) / 1000);
+  html += R"rawliteral(</b> с</div>
         <div class="buttons">
           <form action="/valve" method="post">
             <input type="hidden" name="valve" value="fill">
             <input type="hidden" name="state" value="1">
-            <button class="valve-on" type="submit">&#1047;&#1072;&#1082;&#1088;&#1099;&#1090;&#1100;</button>
+            <button id="fill-close" class="valve-on" type="submit">&#1047;&#1072;&#1082;&#1088;&#1099;&#1090;&#1100;</button>
           </form>
           <form action="/valve" method="post">
             <input type="hidden" name="valve" value="fill">
             <input type="hidden" name="state" value="0">
-            <button class="valve-off" type="submit">&#1054;&#1090;&#1082;&#1088;&#1099;&#1090;&#1100;</button>
+            <button id="fill-open" class="valve-off" type="submit">&#1054;&#1090;&#1082;&#1088;&#1099;&#1090;&#1100;</button>
           </form>
         </div>
       </article>
@@ -1247,20 +1317,24 @@ String generateHTML() {
         <div class="status">&#1057;&#1086;&#1089;&#1090;&#1086;&#1103;&#1085;&#1080;&#1077;: <b id="drain-valve">)rawliteral";
   html += drainValveOn ? "closed" : "open";
   html += R"rawliteral(</b></div>
+        <div class="status">Ожидание перед переключением: <b id="drain-lock">)rawliteral";
+  html += String((valveLockRemainingMs(1) + 999) / 1000);
+  html += R"rawliteral(</b> с</div>
         <div class="buttons">
           <form action="/valve" method="post">
             <input type="hidden" name="valve" value="drain">
             <input type="hidden" name="state" value="1">
-            <button class="valve-on" type="submit">&#1047;&#1072;&#1082;&#1088;&#1099;&#1090;&#1100;</button>
+            <button id="drain-close" class="valve-on" type="submit">&#1047;&#1072;&#1082;&#1088;&#1099;&#1090;&#1100;</button>
           </form>
           <form action="/valve" method="post">
             <input type="hidden" name="valve" value="drain">
             <input type="hidden" name="state" value="0">
-            <button class="valve-off" type="submit">&#1054;&#1090;&#1082;&#1088;&#1099;&#1090;&#1100;</button>
+            <button id="drain-open" class="valve-off" type="submit">&#1054;&#1090;&#1082;&#1088;&#1099;&#1090;&#1100;</button>
           </form>
         </div>
       </article>
     </section>
+    <div id="valve-command-message" role="status"></div>
     <section class="panel">
       <h2>&#1058;&#1069;&#1053;</h2>
       <div class="status">&#1057;&#1086;&#1089;&#1090;&#1086;&#1103;&#1085;&#1080;&#1077;: <b id="heater-state">)rawliteral";
@@ -1280,7 +1354,7 @@ String generateHTML() {
         </form>
         <form action="/heater" method="post">
           <input type="hidden" name="state" value="0">
-          <button class="heater-off" type="submit">&#1042;&#1099;&#1082;&#1083;&#1102;&#1095;&#1080;&#1090;&#1100; &#1058;&#1069;&#1053;</button>
+          <button id="heater-disable" class="heater-off" type="submit">&#1042;&#1099;&#1082;&#1083;&#1102;&#1095;&#1080;&#1090;&#1100; &#1058;&#1069;&#1053;</button>
         </form>
       </div>
     </section>
@@ -1372,7 +1446,7 @@ String generateHTML() {
   html += IPAddress(networkSettings.dns).toString();
   html += R"rawliteral("></label>
         </div>
-        <button class="network-save" type="submit">Сохранить и применить</button>
+        <button id="network-save" class="network-save" type="submit">Сохранить и применить</button>
         <div id="network-message" role="status"></div>
       </form>
     </section>
@@ -1402,6 +1476,10 @@ String generateHTML() {
         const response = await fetch('/status', { cache: 'no-store' });
         if (!response.ok) return;
         const status = await response.json();
+        document.getElementById('startup-status').textContent = status.startupReady
+          ? '\u0413\u043e\u0442\u043e\u0432'
+          : '\u0418\u043d\u0438\u0446\u0438\u0430\u043b\u0438\u0437\u0430\u0446\u0438\u044f: \u043a\u043e\u043c\u0430\u043d\u0434\u044b \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u044b';
+        document.getElementById('network-save').disabled = !status.startupReady;
         document.getElementById('ethernet-link').textContent = status.ethernetLinkUp
           ? 'Кабель подключен'
           : 'Нет связи по кабелю';
@@ -1420,20 +1498,34 @@ String generateHTML() {
         document.getElementById('drain-valve').textContent = status.drainValveOn
           ? '\u0417\u0430\u043a\u0440\u044b\u0442'
           : '\u041e\u0442\u043a\u0440\u044b\u0442';
+        document.getElementById('fill-lock').textContent = status.fillValveLockSeconds;
+        document.getElementById('drain-lock').textContent = status.drainValveLockSeconds;
+        document.getElementById('fill-close').disabled =
+          !status.startupReady || status.fillValveOn || status.fillValveLockSeconds > 0;
+        document.getElementById('fill-open').disabled =
+          !status.startupReady || !status.fillValveOn || status.fillValveLockSeconds > 0;
+        document.getElementById('drain-close').disabled =
+          !status.startupReady || status.drainValveOn || status.drainValveLockSeconds > 0;
+        document.getElementById('drain-open').disabled =
+          !status.startupReady || !status.drainValveOn || status.drainValveLockSeconds > 0;
         document.getElementById('heater-state').textContent = status.heaterOn
           ? '\u0412\u043a\u043b\u044e\u0447\u0435\u043d'
           : '\u0412\u044b\u043a\u043b\u044e\u0447\u0435\u043d';
         document.getElementById('heater-interlock').textContent = status.heaterAllowed
           ? '\u0413\u043e\u0442\u043e\u0432\u043e: \u0443\u0440\u043e\u0432\u0435\u043d\u044c \u0435\u0441\u0442\u044c, \u043a\u0440\u0430\u043d\u044b \u0437\u0430\u043a\u0440\u044b\u0442\u044b'
           : '\u0417\u0430\u043f\u0440\u0435\u0442: \u043d\u0443\u0436\u0435\u043d \u0443\u0440\u043e\u0432\u0435\u043d\u044c \u0432\u043e\u0434\u044b \u0438 \u0437\u0430\u043a\u0440\u044b\u0442\u044b\u0435 \u043a\u0440\u0430\u043d\u044b';
-        document.getElementById('heater-enable').disabled = !status.heaterAllowed;
+        document.getElementById('heater-enable').disabled =
+          !status.startupReady || !status.heaterAllowed;
+        document.getElementById('heater-disable').disabled = !status.startupReady;
         status.drives.forEach((drive, index) => {
           document.getElementById(`sequence-${index}`).textContent = sequences[drive.sequence] || drive.sequence;
           document.getElementById(`position-${index}`).textContent = positions[drive.position] || drive.position;
           document.getElementById(`direction-${index}`).textContent = directions[drive.direction] || drive.direction;
           document.getElementById(`remaining-${index}`).textContent = `${drive.remainingSeconds} \u0441\u0435\u043a`;
-          document.getElementById(`lower-${index}`).disabled = !drive.canLower;
-          document.getElementById(`raise-${index}`).disabled = !drive.canRaise;
+          document.getElementById(`lower-${index}`).disabled =
+            !status.startupReady || !drive.canLower;
+          document.getElementById(`raise-${index}`).disabled =
+            !status.startupReady || !drive.canRaise;
         });
       } catch (error) {
       }
@@ -1467,9 +1559,21 @@ String generateHTML() {
     document.querySelectorAll('form:not(#network-form)').forEach((form) => {
       form.addEventListener('submit', async (event) => {
         event.preventDefault();
-        const body = new URLSearchParams(new FormData(form));
-        await fetch(form.action, { method: 'POST', body, cache: 'no-store' });
-        await refreshStatus();
+        const isValve = form.getAttribute('action') === '/valve';
+        const message = document.getElementById('valve-command-message');
+        try {
+          const body = new URLSearchParams(new FormData(form));
+          const response = await fetch(form.action, {
+            method: 'POST', body, cache: 'no-store'
+          });
+          if (isValve) {
+            message.textContent = response.ok ? '' : await response.text();
+            message.style.color = 'var(--down)';
+          }
+          await refreshStatus();
+        } catch (error) {
+          if (isValve) message.textContent = 'Нет связи с устройством';
+        }
       });
     });
 
@@ -1502,7 +1606,19 @@ void handleStatus() {
   server.send(200, "application/json; charset=UTF-8", statusJson());
 }
 
+bool rejectCommandDuringStartup() {
+  if (!startupInProgress) {
+    return false;
+  }
+  server.sendHeader("Retry-After", "1");
+  server.send(503, "text/plain; charset=UTF-8", "Инициализация: дождитесь закрытия кранов и подъёма приводов");
+  return true;
+}
+
 void handleLower() {
+  if (rejectCommandDuringStartup()) {
+    return;
+  }
   uint8_t driveIndex = webDriveArg();
   if (validDriveIndex(driveIndex)) {
     startLowerSequence(driveIndex);
@@ -1511,6 +1627,9 @@ void handleLower() {
 }
 
 void handleRaise() {
+  if (rejectCommandDuringStartup()) {
+    return;
+  }
   uint8_t driveIndex = webDriveArg();
   if (validDriveIndex(driveIndex)) {
     startRaiseSequence(driveIndex);
@@ -1519,18 +1638,33 @@ void handleRaise() {
 }
 
 void handleValve() {
-  if (server.hasArg("valve") && server.hasArg("state")) {
-    bool enabled = server.arg("state").toInt() != 0;
-    if (server.arg("valve") == "fill") {
-      setFillValve(enabled);
-    } else if (server.arg("valve") == "drain") {
-      setDrainValve(enabled);
-    }
+  if (rejectCommandDuringStartup()) {
+    return;
   }
+  if (!server.hasArg("valve") || !server.hasArg("state") ||
+      (server.arg("state") != "0" && server.arg("state") != "1") ||
+      (server.arg("valve") != "fill" && server.arg("valve") != "drain")) {
+    server.send(400, "text/plain; charset=UTF-8", "Неверная команда крана");
+    return;
+  }
+  uint8_t valveIndex = server.arg("valve") == "fill" ? 0 : 1;
+  bool enabled = server.arg("state") == "1";
+  if (!canChangeValve(valveIndex, enabled)) {
+    uint32_t remainingSeconds = (valveLockRemainingMs(valveIndex) + 999) / 1000;
+    String error = remainingSeconds > 0
+      ? "Кран занят: повторите через " + String(remainingSeconds) + " с"
+      : "Кран уже находится в запрошенном состоянии";
+    server.send(409, "text/plain; charset=UTF-8", error);
+    return;
+  }
+  requestValveState(valveIndex, enabled);
   server.send(204, "text/plain", "");
 }
 
 void handleHeater() {
+  if (rejectCommandDuringStartup()) {
+    return;
+  }
   if (server.hasArg("state")) {
     setHeater(server.arg("state").toInt() != 0);
   }
@@ -1538,6 +1672,9 @@ void handleHeater() {
 }
 
 void handleNetworkSettings() {
+  if (rejectCommandDuringStartup()) {
+    return;
+  }
   if (!server.hasArg("mode") || (server.arg("mode") != "static" && server.arg("mode") != "dhcp")) {
     server.send(400, "text/plain; charset=UTF-8", "Выберите статический IP или DHCP.");
     return;
@@ -1608,7 +1745,7 @@ void setup() {
   mb.addIreg(INPUT_UPTIME_HOURS);
   mb.addIreg(INPUT_END_BASE, 0, DRIVE_COUNT * 2);
   mb.addIreg(INPUT_RELAY_BASE, 0, RELAY_CHANNEL_COUNT);
-  mb.addIreg(INPUT_TEMPERATURE_X10, 0, INPUT_HEATER_STATE - INPUT_TEMPERATURE_X10 + 1);
+  mb.addIreg(INPUT_TEMPERATURE_X10, 0, INPUT_VALVE_LOCK_SECONDS - INPUT_TEMPERATURE_X10 + 1);
   mb.addIreg(INPUT_DRIVE_BASE, 0, DRIVE_COUNT * 5);
   mb.onRequest(validateModbusRequest);
   mb.onRequestSuccess(onModbusRequestSuccess);
@@ -1662,6 +1799,11 @@ void loop() {
 
   for (uint8_t i = 0; i < DRIVE_COUNT; i++) {
     updateDriveSequence(i);
+  }
+  if (startupInProgress && !anyDriveBusy() &&
+      valveLockRemainingMs(0) == 0 && valveLockRemainingMs(1) == 0) {
+    startupInProgress = false;
+    Serial.println("Startup complete: commands enabled");
   }
 
   uint32_t nowMs = millis();

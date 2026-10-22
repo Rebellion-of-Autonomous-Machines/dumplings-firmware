@@ -1,12 +1,14 @@
 #include <Arduino.h>
 #include <DallasTemperature.h>
 #include <DNSServer.h>
-#include <ModbusRTU.h>
+#include <ETH.h>
+#include <ModbusTCP.h>
 #include <OneWire.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <Wire.h>
+#include <esp_timer.h>
 
 static const uint8_t I2C_SDA = 4;
 static const uint8_t I2C_SCL = 5;
@@ -27,11 +29,35 @@ static const uint8_t HEATER_PHASE_A_CHANNEL = 11;
 static const uint8_t HEATER_PHASE_B_CHANNEL = 12;
 static const uint8_t HEATER_PHASE_C_CHANNEL = 13;
 
-static const uint8_t RS485_RX_PIN = 16;
-static const uint8_t RS485_TX_PIN = 13;
-static const int8_t RS485_DE_PIN = -1; // -1 = no DE/RE pin, transceiver must use auto-direction or fixed RX/TX enable
-static const uint32_t RS485_BAUDRATE = 9600;
-static const uint8_t MODBUS_SLAVE_ID = 1;
+static const uint8_t KC_ETH_PHY_ADDRESS = 0;
+static const int8_t KC_ETH_POWER_PIN = -1;
+static const uint8_t KC_ETH_MDC_PIN = 23;
+static const uint8_t KC_ETH_MDIO_PIN = 18;
+static const uint16_t MODBUS_TCP_PORT = 502;
+static const IPAddress DEFAULT_ETHERNET_IP(192, 168, 1, 240);
+static const IPAddress DEFAULT_ETHERNET_GATEWAY(192, 168, 1, 1);
+static const IPAddress DEFAULT_ETHERNET_SUBNET(255, 255, 255, 0);
+
+struct NetworkSettings {
+  uint32_t marker;
+  uint32_t ip;
+  uint32_t subnet;
+  uint32_t gateway;
+  uint32_t dns;
+  uint32_t useDhcp;
+};
+
+static const uint32_t NETWORK_SETTINGS_MARKER = 0x4E455431;
+NetworkSettings networkSettings = {
+  NETWORK_SETTINGS_MARKER,
+  static_cast<uint32_t>(DEFAULT_ETHERNET_IP),
+  static_cast<uint32_t>(DEFAULT_ETHERNET_SUBNET),
+  static_cast<uint32_t>(DEFAULT_ETHERNET_GATEWAY),
+  static_cast<uint32_t>(DEFAULT_ETHERNET_GATEWAY),
+  0
+};
+bool networkApplyPending = false;
+uint32_t networkApplyRequestedAtMs = 0;
 
 const char* ap_ssid = "dumplings";
 const char* ap_password = "clickclick";
@@ -45,8 +71,7 @@ uint8_t shakeCount = 8;
 
 WebServer server(80);
 DNSServer dnsServer;
-HardwareSerial RS485Serial(2);
-ModbusRTU mb;
+ModbusTCP mb;
 Preferences preferences;
 OneWire oneWire(DALLAS_PIN);
 DallasTemperature dallasSensors(&oneWire);
@@ -54,31 +79,40 @@ DallasTemperature dallasSensors(&oneWire);
 static const uint16_t DNS_PORT = 53;
 
 enum ModbusReg : uint16_t {
-  REG_GLOBAL_STATUS = 0,       // RO bit0 any_busy
-  REG_COMMAND = 1,             // RW, resets to 0 after processing
-  REG_COMMAND_DRIVE = 2,       // RW 1..3, 0 = all for stop
-  REG_COMMAND_RESULT = 3,      // RO
-  REG_LOWER_TIME_MS = 4,       // RW
-  REG_RAISE_FULL_TIME_MS = 5,  // RW
-  REG_RAISE_BEFORE_SHAKE_MS = 6, // RW
-  REG_SHAKE_UP_TIME_MS = 7,    // RW
-  REG_SHAKE_DOWN_TIME_MS = 8,  // RW
-  REG_SHAKE_COUNT = 9,         // RW
-  REG_DRIVE_BASE = 10,         // 5 regs per drive: status, sequence, direction, remaining_ms, position
-  REG_VALVE_STATUS = 25,       // RO bit0 fill, bit1 drain
-  REG_VALVE_CONTROL = 26,      // RW bit0 fill, bit1 drain
-  REG_TEMPERATURE_X10 = 27,    // RO int16, 0x8000 = no data
-  REG_DALLAS_COUNT = 28,       // RO
-  REG_HEATER_STATUS = 29,      // RO 0/1
-  REG_HEATER_CONTROL = 30,     // RW 0/1
-  REG_REG_COUNT = 32
+  REG_STAT_MODE = 0,
+  REG_STAT_ERROR = 1,
+  REG_LOWER_TIME_MS = 7,
+  REG_RAISE_FULL_TIME_MS = 8,
+  REG_RAISE_BEFORE_SHAKE_MS = 9,
+  REG_SHAKE_UP_TIME_MS = 10,
+  REG_SHAKE_DOWN_TIME_MS = 11,
+  REG_SHAKE_COUNT = 12,
+  REG_VALVE_CONTROL = 13,
+  REG_HEATER_CONTROL = 14,
+  REG_SERVICE_COMMAND = 15,
+  REG_COMMAND_RESULT = 16,
+  REG_PROTOCOL_VERSION = 17,
+  REG_COMMAND_DRIVE = 18
+};
+
+enum ModbusInputReg : uint16_t {
+  INPUT_UPTIME_HOURS = 0,
+  INPUT_END_BASE = 20,
+  INPUT_RELAY_BASE = 50,
+  INPUT_TEMPERATURE_X10 = 70,
+  INPUT_DALLAS_COUNT = 71,
+  INPUT_FLOAT_SENSOR = 72,
+  INPUT_VALVE_STATUS = 73,
+  INPUT_HEATER_STATUS = 74,
+  INPUT_GLOBAL_STATUS = 75,
+  INPUT_FILL_STATE = 76,
+  INPUT_DRAIN_STATE = 77,
+  INPUT_HEATER_STATE = 78,
+  INPUT_DRIVE_BASE = 80
 };
 
 enum ModbusCommand : uint16_t {
   CMD_NONE = 0,
-  CMD_LOWER = 1,
-  CMD_RAISE = 2,
-  CMD_STOP = 3,
   CMD_SAVE_SETTINGS = 4,
   CMD_STARTUP_RAISE = 5
 };
@@ -141,6 +175,7 @@ bool fillValveOn = false;
 bool drainValveOn = false;
 bool modbusReady = false;
 bool heaterOn = false;
+bool ethernetStarted = false;
 float waterTemperatureC = NAN;
 uint8_t dallasDeviceCount = 0;
 uint32_t lastTemperatureReadMs = 0;
@@ -152,6 +187,89 @@ void syncValveModbusRegisters();
 void syncHeaterModbusRegisters();
 bool heaterInterlockOk();
 void enforceHeaterInterlock();
+
+bool parseIPv4(const String& text, IPAddress& address) {
+  String value = text;
+  value.trim();
+  return address.fromString(value);
+}
+
+bool validNetworkSettings(const NetworkSettings& settings) {
+  if (settings.marker != NETWORK_SETTINGS_MARKER || settings.useDhcp > 1) {
+    return false;
+  }
+  IPAddress ip(settings.ip);
+  IPAddress subnet(settings.subnet);
+  IPAddress gateway(settings.gateway);
+  IPAddress dns(settings.dns);
+  uint32_t mask = (static_cast<uint32_t>(subnet[0]) << 24) |
+                  (static_cast<uint32_t>(subnet[1]) << 16) |
+                  (static_cast<uint32_t>(subnet[2]) << 8) | subnet[3];
+  uint32_t wildcard = ~mask;
+  if (mask == 0 || mask == 0xFFFFFFFF || (wildcard & (wildcard + 1)) != 0) {
+    return false;
+  }
+  if (ip[0] == 0 || ip[0] >= 224 || gateway[0] == 0 || gateway[0] >= 224 ||
+      dns[0] == 0 || dns[0] >= 224 || ip == gateway) {
+    return false;
+  }
+  return (settings.ip & settings.subnet) == (settings.gateway & settings.subnet);
+}
+
+void loadNetworkSettings() {
+  Preferences storage;
+  if (!storage.begin("ethernet", true)) {
+    return;
+  }
+  NetworkSettings saved;
+  if (storage.getBytesLength("config") == sizeof(saved) &&
+      storage.getBytes("config", &saved, sizeof(saved)) == sizeof(saved) &&
+      validNetworkSettings(saved)) {
+    networkSettings = saved;
+  }
+  storage.end();
+}
+
+bool saveNetworkSettings(const NetworkSettings& settings) {
+  Preferences storage;
+  if (!storage.begin("ethernet", false)) {
+    return false;
+  }
+  bool saved = storage.putBytes("config", &settings, sizeof(settings)) == sizeof(settings);
+  storage.end();
+  return saved;
+}
+
+bool applyEthernetSettings() {
+  if (networkSettings.useDhcp) {
+    return ETH.config(IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0), IPAddress(0, 0, 0, 0));
+  }
+  return ETH.config(IPAddress(networkSettings.ip), IPAddress(networkSettings.gateway),
+                    IPAddress(networkSettings.subnet), IPAddress(networkSettings.dns));
+}
+
+void onNetworkEvent(WiFiEvent_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_ETH_START:
+      Serial.println("Ethernet: started");
+      break;
+    case ARDUINO_EVENT_ETH_CONNECTED:
+      Serial.println("Ethernet: cable link up");
+      break;
+    case ARDUINO_EVENT_ETH_GOT_IP:
+      Serial.print("Ethernet IP: ");
+      Serial.println(ETH.localIP());
+      break;
+    case ARDUINO_EVENT_ETH_DISCONNECTED:
+      Serial.println("Ethernet: cable link down");
+      break;
+    case ARDUINO_EVENT_ETH_STOP:
+      Serial.println("Ethernet: stopped");
+      break;
+    default:
+      break;
+  }
+}
 
 uint16_t clampU16(uint32_t value) {
   return value > 65535 ? 65535 : static_cast<uint16_t>(value);
@@ -402,7 +520,6 @@ void syncValveModbusRegisters() {
   }
 
   uint16_t bits = valveStatusBits();
-  mb.Hreg(REG_VALVE_STATUS, bits);
   mb.Hreg(REG_VALVE_CONTROL, bits);
 }
 
@@ -412,7 +529,6 @@ void syncHeaterModbusRegisters() {
   }
 
   uint16_t value = heaterOn ? 1 : 0;
-  mb.Hreg(REG_HEATER_STATUS, value);
   mb.Hreg(REG_HEATER_CONTROL, value);
 }
 
@@ -520,17 +636,6 @@ void startStartupRaiseSequence(uint8_t driveIndex) {
   drives[driveIndex].position = POSITION_UNKNOWN;
   resetDriveDoneState(driveIndex);
   startDriveStep(driveIndex, SEQUENCE_RAISE_FINAL, LIFT_UP, raiseFullTimeMs);
-}
-
-void stopDriveAndForgetPosition(uint8_t driveIndex) {
-  if (!validDriveIndex(driveIndex)) {
-    return;
-  }
-
-  stopDrive(driveIndex);
-  drives[driveIndex].sequence = SEQUENCE_IDLE;
-  drives[driveIndex].sequenceFinishedAtMs = 0;
-  drives[driveIndex].position = POSITION_UNKNOWN;
 }
 
 void updateDriveSequence(uint8_t driveIndex) {
@@ -674,31 +779,63 @@ void syncModbusRegistersFromState() {
   if (!heaterInterlockOk()) {
     globalStatus |= (1U << 2);
   }
-  mb.Hreg(REG_GLOBAL_STATUS, globalStatus);
+  uint16_t mode = 1;
+  for (uint8_t driveIndex = 0; driveIndex < DRIVE_COUNT; driveIndex++) {
+    LiftSequence sequence = drives[driveIndex].sequence;
+    if (sequence == SEQUENCE_LOWERING) {
+      mode = 11 + driveIndex;
+      break;
+    }
+    if (sequence >= SEQUENCE_RAISE_INITIAL && sequence <= SEQUENCE_RAISE_FINAL) {
+      mode = 14 + driveIndex;
+      break;
+    }
+    if (sequence == SEQUENCE_DONE) {
+      mode = 19;
+    }
+  }
+  mb.Hreg(REG_STAT_MODE, mode);
+  mb.Hreg(REG_STAT_ERROR, 0);
   mb.Hreg(REG_LOWER_TIME_MS, clampU16(lowerTimeMs));
   mb.Hreg(REG_RAISE_FULL_TIME_MS, clampU16(raiseFullTimeMs));
   mb.Hreg(REG_RAISE_BEFORE_SHAKE_MS, clampU16(raiseBeforeShakeTimeMs));
   mb.Hreg(REG_SHAKE_UP_TIME_MS, clampU16(shakeUpTimeMs));
   mb.Hreg(REG_SHAKE_DOWN_TIME_MS, clampU16(shakeDownTimeMs));
   mb.Hreg(REG_SHAKE_COUNT, shakeCount);
-  mb.Hreg(REG_VALVE_STATUS, valveStatusBits());
   mb.Hreg(REG_VALVE_CONTROL, valveStatusBits());
   uint16_t temperatureReg = 0x8000;
   if (!isnan(waterTemperatureC)) {
     temperatureReg = floatToI16Reg(waterTemperatureC, 10.0f);
   }
-  mb.Hreg(REG_TEMPERATURE_X10, temperatureReg);
-  mb.Hreg(REG_DALLAS_COUNT, dallasDeviceCount);
-  mb.Hreg(REG_HEATER_STATUS, heaterOn ? 1 : 0);
   mb.Hreg(REG_HEATER_CONTROL, heaterOn ? 1 : 0);
+  mb.Hreg(REG_PROTOCOL_VERSION, 2);
+
+  uint64_t uptimeHours = static_cast<uint64_t>(esp_timer_get_time()) / 3600000000ULL;
+  mb.Ireg(INPUT_UPTIME_HOURS, uptimeHours > 65535 ? 65535 : static_cast<uint16_t>(uptimeHours));
+  for (uint8_t driveIndex = 0; driveIndex < DRIVE_COUNT; driveIndex++) {
+    mb.Ireg(INPUT_END_BASE + driveIndex * 2, drives[driveIndex].position == POSITION_TOP ? 1 : 0);
+    mb.Ireg(INPUT_END_BASE + driveIndex * 2 + 1, drives[driveIndex].position == POSITION_BOTTOM ? 1 : 0);
+  }
+  for (uint8_t channel = 0; channel < RELAY_CHANNEL_COUNT; channel++) {
+    mb.Ireg(INPUT_RELAY_BASE + channel, relayOn[channel] ? 1 : 0);
+  }
+  mb.Ireg(INPUT_TEMPERATURE_X10, temperatureReg);
+  mb.Ireg(INPUT_DALLAS_COUNT, dallasDeviceCount);
+  mb.Ireg(INPUT_FLOAT_SENSOR, floatSensorActive ? 1 : 0);
+  mb.Ireg(INPUT_VALVE_STATUS, valveStatusBits());
+  mb.Ireg(INPUT_HEATER_STATUS, heaterOn ? 1 : 0);
+  mb.Ireg(INPUT_GLOBAL_STATUS, globalStatus);
+  mb.Ireg(INPUT_FILL_STATE, fillValveOn ? 1 : 0);
+  mb.Ireg(INPUT_DRAIN_STATE, drainValveOn ? 1 : 0);
+  mb.Ireg(INPUT_HEATER_STATE, heaterOn ? 1 : (heaterInterlockOk() ? 0 : 2));
 
   for (uint8_t driveIndex = 0; driveIndex < DRIVE_COUNT; driveIndex++) {
-    uint16_t base = REG_DRIVE_BASE + (driveIndex * 5);
-    mb.Hreg(base + 0, driveStatusBits(driveIndex));
-    mb.Hreg(base + 1, static_cast<uint16_t>(drives[driveIndex].sequence));
-    mb.Hreg(base + 2, static_cast<uint16_t>(drives[driveIndex].direction));
-    mb.Hreg(base + 3, clampU16(remainingStepMs(driveIndex)));
-    mb.Hreg(base + 4, static_cast<uint16_t>(drives[driveIndex].position));
+    uint16_t base = INPUT_DRIVE_BASE + (driveIndex * 5);
+    mb.Ireg(base + 0, driveStatusBits(driveIndex));
+    mb.Ireg(base + 1, static_cast<uint16_t>(drives[driveIndex].sequence));
+    mb.Ireg(base + 2, static_cast<uint16_t>(drives[driveIndex].direction));
+    mb.Ireg(base + 3, clampU16(remainingStepMs(driveIndex)));
+    mb.Ireg(base + 4, static_cast<uint16_t>(drives[driveIndex].position));
   }
 }
 
@@ -770,28 +907,6 @@ uint16_t handleDriveCommand(uint16_t cmd, uint8_t driveIndex) {
     return CMD_RES_INVALID_ARG;
   }
 
-  if (cmd == CMD_LOWER) {
-    if (driveBusy(driveIndex)) {
-      return CMD_RES_BUSY;
-    }
-    if (!canLower(driveIndex)) {
-      return CMD_RES_INVALID_ARG;
-    }
-    startLowerSequence(driveIndex);
-    return CMD_RES_OK;
-  }
-
-  if (cmd == CMD_RAISE) {
-    if (driveBusy(driveIndex)) {
-      return CMD_RES_BUSY;
-    }
-    if (!canRaise(driveIndex)) {
-      return CMD_RES_INVALID_ARG;
-    }
-    startRaiseSequence(driveIndex);
-    return CMD_RES_OK;
-  }
-
   if (cmd == CMD_STARTUP_RAISE) {
     if (driveBusy(driveIndex)) {
       return CMD_RES_BUSY;
@@ -807,7 +922,7 @@ uint16_t handleDriveCommand(uint16_t cmd, uint8_t driveIndex) {
 }
 
 void handleModbusCommand() {
-  uint16_t cmd = mb.Hreg(REG_COMMAND);
+  uint16_t cmd = mb.Hreg(REG_SERVICE_COMMAND);
   if (cmd == CMD_NONE) {
     return;
   }
@@ -815,30 +930,114 @@ void handleModbusCommand() {
   uint16_t result = CMD_RES_OK;
   uint16_t driveArg = mb.Hreg(REG_COMMAND_DRIVE);
 
-  if (cmd == CMD_STOP) {
-    if (driveArg == 0) {
-      for (uint8_t i = 0; i < DRIVE_COUNT; i++) {
-        stopDriveAndForgetPosition(i);
-      }
-    } else if (driveArg >= 1 && driveArg <= DRIVE_COUNT) {
-      stopDriveAndForgetPosition(static_cast<uint8_t>(driveArg - 1));
-    } else {
-      result = CMD_RES_INVALID_ARG;
-    }
-  } else if (cmd == CMD_SAVE_SETTINGS) {
+  if (cmd == CMD_SAVE_SETTINGS) {
     if (anyDriveBusy()) {
       result = CMD_RES_BUSY;
     } else {
       saveTimingSettings();
     }
-  } else if (driveArg >= 1 && driveArg <= DRIVE_COUNT) {
-    result = handleDriveCommand(cmd, static_cast<uint8_t>(driveArg - 1));
+  } else if (cmd == CMD_STARTUP_RAISE) {
+    if (driveArg >= 1 && driveArg <= DRIVE_COUNT) {
+      result = handleDriveCommand(cmd, static_cast<uint8_t>(driveArg - 1));
+    } else {
+      result = CMD_RES_INVALID_ARG;
+    }
   } else {
-    result = CMD_RES_INVALID_ARG;
+    result = CMD_RES_UNKNOWN_CMD;
   }
 
   mb.Hreg(REG_COMMAND_RESULT, result);
-  mb.Hreg(REG_COMMAND, CMD_NONE);
+  mb.Hreg(REG_SERVICE_COMMAND, CMD_NONE);
+}
+
+bool readableHoldingRange(uint16_t address, uint16_t count) {
+  return count > 0 && ((address <= REG_STAT_ERROR && address + count <= REG_STAT_ERROR + 1) ||
+                       (address >= REG_LOWER_TIME_MS && address + count <= REG_COMMAND_DRIVE + 1));
+}
+
+bool readableInputRange(uint16_t address, uint16_t count) {
+  if (count == 0) {
+    return false;
+  }
+  uint32_t end = static_cast<uint32_t>(address) + count;
+  return (address == INPUT_UPTIME_HOURS && end == 1) ||
+         (address >= INPUT_END_BASE && end <= INPUT_END_BASE + DRIVE_COUNT * 2) ||
+         (address >= INPUT_RELAY_BASE && end <= INPUT_RELAY_BASE + RELAY_CHANNEL_COUNT) ||
+         (address >= INPUT_TEMPERATURE_X10 && end <= INPUT_HEATER_STATE + 1) ||
+         (address >= INPUT_DRIVE_BASE && end <= INPUT_DRIVE_BASE + DRIVE_COUNT * 5);
+}
+
+Modbus::ResultCode validateModbusRequest(Modbus::FunctionCode function, const Modbus::RequestData data) {
+  uint16_t address = data.reg.address;
+  if (function == Modbus::FC_READ_REGS) {
+    if (address <= 6 && static_cast<uint32_t>(address) + data.regCount > 2) {
+      return Modbus::EX_ILLEGAL_VALUE;
+    }
+    return readableHoldingRange(address, data.regCount) ? Modbus::EX_SUCCESS : Modbus::EX_ILLEGAL_ADDRESS;
+  }
+  if (function == Modbus::FC_READ_INPUT_REGS) {
+    return readableInputRange(address, data.regCount) ? Modbus::EX_SUCCESS : Modbus::EX_ILLEGAL_ADDRESS;
+  }
+  if (function == Modbus::FC_WRITE_REGS) {
+    return Modbus::EX_ILLEGAL_VALUE;
+  }
+  if (function != Modbus::FC_WRITE_REG) {
+    return Modbus::EX_ILLEGAL_FUNCTION;
+  }
+  uint16_t value = data.regCount;
+  if (address >= 2 && address <= 6) {
+    return Modbus::EX_ILLEGAL_VALUE;
+  }
+  if (address == REG_STAT_MODE) {
+    if (value < 11 || value > 16 || mb.Hreg(REG_STAT_MODE) != 1 || anyDriveBusy()) {
+      return Modbus::EX_ILLEGAL_VALUE;
+    }
+    uint8_t driveIndex = (value - 11) % DRIVE_COUNT;
+    bool canMove = value <= 13 ? canLower(driveIndex) : canRaise(driveIndex);
+    return canMove ? Modbus::EX_SUCCESS : Modbus::EX_ILLEGAL_VALUE;
+  }
+  if (address == REG_STAT_ERROR || address == REG_COMMAND_RESULT || address == REG_PROTOCOL_VERSION) {
+    return Modbus::EX_ILLEGAL_VALUE;
+  }
+  if (address >= REG_LOWER_TIME_MS && address <= REG_SHAKE_COUNT) {
+    uint32_t lower = address == REG_LOWER_TIME_MS ? value : lowerTimeMs;
+    uint32_t raiseFull = address == REG_RAISE_FULL_TIME_MS ? value : raiseFullTimeMs;
+    uint32_t raiseBefore = address == REG_RAISE_BEFORE_SHAKE_MS ? value : raiseBeforeShakeTimeMs;
+    uint32_t shakeUp = address == REG_SHAKE_UP_TIME_MS ? value : shakeUpTimeMs;
+    uint32_t shakeDown = address == REG_SHAKE_DOWN_TIME_MS ? value : shakeDownTimeMs;
+    uint16_t shakes = address == REG_SHAKE_COUNT ? value : shakeCount;
+    return !anyDriveBusy() && validTimingSettings(lower, raiseFull, raiseBefore, shakeUp, shakeDown, shakes)
+             ? Modbus::EX_SUCCESS : Modbus::EX_ILLEGAL_VALUE;
+  }
+  if (address == REG_VALVE_CONTROL) {
+    return value <= 3 ? Modbus::EX_SUCCESS : Modbus::EX_ILLEGAL_VALUE;
+  }
+  if (address == REG_HEATER_CONTROL) {
+    return value <= 1 && (value == 0 || heaterInterlockOk()) ? Modbus::EX_SUCCESS : Modbus::EX_ILLEGAL_VALUE;
+  }
+  if (address == REG_SERVICE_COMMAND) {
+    bool valid = value == CMD_SAVE_SETTINGS || (value == CMD_STARTUP_RAISE &&
+      mb.Hreg(REG_COMMAND_DRIVE) >= 1 && mb.Hreg(REG_COMMAND_DRIVE) <= DRIVE_COUNT &&
+      canRaise(mb.Hreg(REG_COMMAND_DRIVE) - 1));
+    return valid && !anyDriveBusy() ? Modbus::EX_SUCCESS : Modbus::EX_ILLEGAL_VALUE;
+  }
+  if (address == REG_COMMAND_DRIVE) {
+    return value >= 1 && value <= DRIVE_COUNT ? Modbus::EX_SUCCESS : Modbus::EX_ILLEGAL_VALUE;
+  }
+  return Modbus::EX_ILLEGAL_ADDRESS;
+}
+
+Modbus::ResultCode onModbusRequestSuccess(Modbus::FunctionCode function, const Modbus::RequestData data) {
+  if (function == Modbus::FC_WRITE_REG && data.reg.address == REG_STAT_MODE) {
+    uint16_t value = data.regCount;
+    uint8_t driveIndex = (value - 11) % DRIVE_COUNT;
+    if (value <= 13) {
+      startLowerSequence(driveIndex);
+    } else {
+      startRaiseSequence(driveIndex);
+    }
+  }
+  return Modbus::EX_SUCCESS;
 }
 
 void initDriveStates() {
@@ -875,6 +1074,9 @@ String driveJson(uint8_t driveIndex) {
 String statusJson() {
   String json = "{";
   json += "\"anyBusy\":" + String(anyDriveBusy() ? "true" : "false") + ",";
+  json += "\"ethernetStarted\":" + String(ethernetStarted ? "true" : "false") + ",";
+  json += "\"ethernetLinkUp\":" + String(ETH.linkUp() ? "true" : "false") + ",";
+  json += "\"ethernetIp\":\"" + ETH.localIP().toString() + "\",";
   json += "\"floatSensorActive\":" + String(floatSensorActive ? "true" : "false") + ",";
   json += "\"heaterAllowed\":" + String(heaterInterlockOk() ? "true" : "false") + ",";
   json += "\"inputRaw\":" + String(inputExpanderRaw) + ",";
@@ -983,14 +1185,34 @@ String generateHTML() {
     .valve-off { background: #6b7280; }
     .heater-on { background: #b91c1c; }
     .heater-off { background: #6b7280; }
+    .network-fields {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .network-fields label { display: grid; gap: 4px; font-size: 14px; }
+    .network-fields input, .network-fields select {
+      min-width: 0;
+      padding: 9px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font: inherit;
+    }
+    .network-save { background: #1d4ed8; margin-top: 12px; }
+    #network-message { margin-top: 8px; min-height: 20px; }
     @media (max-width: 760px) {
-      .grid, .valves { grid-template-columns: 1fr; }
+      .grid, .valves, .network-fields { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
   <main>
     <h1>&#1055;&#1077;&#1083;&#1100;&#1084;&#1077;&#1085;&#1077;&#1074;&#1072;&#1088;&#1082;&#1072;</h1>
+    <div class="status">Ethernet: <b id="ethernet-link">)rawliteral";
+  html += ETH.linkUp() ? "link up" : "link down";
+  html += R"rawliteral(</b>, IP: <b id="ethernet-ip">)rawliteral";
+  html += ETH.localIP().toString();
+  html += R"rawliteral(</b>, Modbus TCP: 502</div>
     <div class="status">&#1055;&#1086;&#1087;&#1083;&#1072;&#1074;&#1082;&#1086;&#1074;&#1099;&#1081; &#1076;&#1072;&#1090;&#1095;&#1080;&#1082;: <b id="float-sensor">)rawliteral";
   html += floatSensorActive ? "ok" : "low";
   html += R"rawliteral(</b>, RAW: <b id="input-raw">)rawliteral";
@@ -1123,6 +1345,37 @@ String generateHTML() {
 
   html += R"rawliteral(
     </section>
+    <section class="panel" style="margin-top: 12px">
+      <h2>Ethernet / Modbus TCP</h2>
+      <form id="network-form" action="/network" method="post">
+        <div class="network-fields">
+          <label>Режим адресации
+            <select id="network-mode" name="mode">
+              <option value="static")rawliteral";
+  if (!networkSettings.useDhcp) html += " selected";
+  html += R"rawliteral(>Статический IP</option>
+              <option value="dhcp")rawliteral";
+  if (networkSettings.useDhcp) html += " selected";
+  html += R"rawliteral(>DHCP</option>
+            </select>
+          </label>
+          <label>IP-адрес <input class="static-network-field" name="ip" value=")rawliteral";
+  html += IPAddress(networkSettings.ip).toString();
+  html += R"rawliteral("></label>
+          <label>Маска подсети <input class="static-network-field" name="subnet" value=")rawliteral";
+  html += IPAddress(networkSettings.subnet).toString();
+  html += R"rawliteral("></label>
+          <label>Шлюз <input class="static-network-field" name="gateway" value=")rawliteral";
+  html += IPAddress(networkSettings.gateway).toString();
+  html += R"rawliteral("></label>
+          <label>DNS <input class="static-network-field" name="dns" value=")rawliteral";
+  html += IPAddress(networkSettings.dns).toString();
+  html += R"rawliteral("></label>
+        </div>
+        <button class="network-save" type="submit">Сохранить и применить</button>
+        <div id="network-message" role="status"></div>
+      </form>
+    </section>
   </main>
   <script>
     const sequences = {
@@ -1149,6 +1402,10 @@ String generateHTML() {
         const response = await fetch('/status', { cache: 'no-store' });
         if (!response.ok) return;
         const status = await response.json();
+        document.getElementById('ethernet-link').textContent = status.ethernetLinkUp
+          ? 'Кабель подключен'
+          : 'Нет связи по кабелю';
+        document.getElementById('ethernet-ip').textContent = status.ethernetIp;
         document.getElementById('float-sensor').textContent = status.floatSensorActive
           ? '\u0412\u043e\u0434\u0430 \u043d\u0430 \u043d\u0443\u0436\u043d\u043e\u043c \u0443\u0440\u043e\u0432\u043d\u0435'
           : '\u0412\u043e\u0434\u044b \u043d\u0435\u0434\u043e\u0441\u0442\u0430\u0442\u043e\u0447\u043d\u043e';
@@ -1182,7 +1439,32 @@ String generateHTML() {
       }
     }
 
-    document.querySelectorAll('form').forEach((form) => {
+    function updateNetworkMode() {
+      const useDhcp = document.getElementById('network-mode').value === 'dhcp';
+      document.querySelectorAll('.static-network-field').forEach((field) => {
+        field.disabled = useDhcp;
+      });
+    }
+    document.getElementById('network-mode').addEventListener('change', updateNetworkMode);
+    updateNetworkMode();
+
+    document.getElementById('network-form').addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      const message = document.getElementById('network-message');
+      try {
+        const response = await fetch(form.action, {
+          method: 'POST', body: new URLSearchParams(new FormData(form)), cache: 'no-store'
+        });
+        message.textContent = await response.text();
+        message.style.color = response.ok ? 'var(--up)' : 'var(--down)';
+      } catch (error) {
+        message.textContent = 'Связь прервана. Проверьте новый IP или подключитесь к Wi-Fi dumplings.';
+        message.style.color = 'var(--down)';
+      }
+    });
+
+    document.querySelectorAll('form:not(#network-form)').forEach((form) => {
       form.addEventListener('submit', async (event) => {
         event.preventDefault();
         const body = new URLSearchParams(new FormData(form));
@@ -1255,6 +1537,43 @@ void handleHeater() {
   server.send(204, "text/plain", "");
 }
 
+void handleNetworkSettings() {
+  if (!server.hasArg("mode") || (server.arg("mode") != "static" && server.arg("mode") != "dhcp")) {
+    server.send(400, "text/plain; charset=UTF-8", "Выберите статический IP или DHCP.");
+    return;
+  }
+
+  NetworkSettings requested = networkSettings;
+  requested.useDhcp = server.arg("mode") == "dhcp" ? 1 : 0;
+  if (!requested.useDhcp) {
+    IPAddress ip, subnet, gateway, dns;
+    if (!server.hasArg("ip") || !server.hasArg("subnet") ||
+        !server.hasArg("gateway") || !server.hasArg("dns") ||
+        !parseIPv4(server.arg("ip"), ip) || !parseIPv4(server.arg("subnet"), subnet) ||
+        !parseIPv4(server.arg("gateway"), gateway) || !parseIPv4(server.arg("dns"), dns)) {
+      server.send(400, "text/plain; charset=UTF-8", "Проверьте формат IPv4-адресов.");
+      return;
+    }
+    requested.ip = static_cast<uint32_t>(ip);
+    requested.subnet = static_cast<uint32_t>(subnet);
+    requested.gateway = static_cast<uint32_t>(gateway);
+    requested.dns = static_cast<uint32_t>(dns);
+  }
+  if (!validNetworkSettings(requested)) {
+    server.send(400, "text/plain; charset=UTF-8", "Недопустимые IP, маска или шлюз.");
+    return;
+  }
+  if (!saveNetworkSettings(requested)) {
+    server.send(500, "text/plain; charset=UTF-8", "Не удалось сохранить настройки в память ESP32.");
+    return;
+  }
+  networkSettings = requested;
+  networkApplyPending = true;
+  networkApplyRequestedAtMs = millis();
+  server.send(200, "text/plain; charset=UTF-8",
+              "Настройки сохранены. Ethernet переключится примерно через секунду; подключитесь к новому IP.");
+}
+
 void handleRedirectToRoot() {
   server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
   server.send(302, "text/plain", "");
@@ -1264,6 +1583,7 @@ void setup() {
   initializeRelayExpandersSafe();
   Serial.begin(115200);
   loadTimingSettings();
+  loadNetworkSettings();
   initDriveStates();
   closeValvesByDefault();
   updateFloatSensor();
@@ -1272,17 +1592,26 @@ void setup() {
   dallasDeviceCount = dallasSensors.getDeviceCount();
   updateDallasTemperature(millis());
 
+  WiFi.onEvent(onNetworkEvent);
+  ethernetStarted = ETH.begin(KC_ETH_PHY_ADDRESS, KC_ETH_POWER_PIN, KC_ETH_MDC_PIN, KC_ETH_MDIO_PIN,
+                               ETH_PHY_LAN8720, ETH_CLOCK_GPIO17_OUT);
+  if (!ethernetStarted) {
+    Serial.println("Ethernet: start failed");
+  } else if (!applyEthernetSettings()) {
+    Serial.println("Ethernet: IP configuration failed");
+  }
   WiFi.softAP(ap_ssid, ap_password);
   delay(200);
-
-  RS485Serial.begin(RS485_BAUDRATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-  if (RS485_DE_PIN >= 0) {
-    mb.begin(&RS485Serial, RS485_DE_PIN);
-  } else {
-    mb.begin(&RS485Serial);
-  }
-  mb.slave(MODBUS_SLAVE_ID);
-  mb.addHreg(REG_GLOBAL_STATUS, 0, REG_REG_COUNT);
+  mb.server(MODBUS_TCP_PORT);
+  mb.addHreg(REG_STAT_MODE, 1, 2);
+  mb.addHreg(REG_LOWER_TIME_MS, 0, REG_COMMAND_DRIVE - REG_LOWER_TIME_MS + 1);
+  mb.addIreg(INPUT_UPTIME_HOURS);
+  mb.addIreg(INPUT_END_BASE, 0, DRIVE_COUNT * 2);
+  mb.addIreg(INPUT_RELAY_BASE, 0, RELAY_CHANNEL_COUNT);
+  mb.addIreg(INPUT_TEMPERATURE_X10, 0, INPUT_HEATER_STATE - INPUT_TEMPERATURE_X10 + 1);
+  mb.addIreg(INPUT_DRIVE_BASE, 0, DRIVE_COUNT * 5);
+  mb.onRequest(validateModbusRequest);
+  mb.onRequestSuccess(onModbusRequestSuccess);
   modbusReady = true;
   mb.Hreg(REG_COMMAND_RESULT, CMD_RES_OK);
   syncModbusRegistersFromState();
@@ -1295,6 +1624,7 @@ void setup() {
   server.on("/raise", HTTP_POST, handleRaise);
   server.on("/valve", HTTP_POST, handleValve);
   server.on("/heater", HTTP_POST, handleHeater);
+  server.on("/network", HTTP_POST, handleNetworkSettings);
   server.on("/generate_204", HTTP_GET, handleRedirectToRoot);
   server.on("/hotspot-detect.html", HTTP_GET, handleRedirectToRoot);
   server.on("/fwlink", HTTP_GET, handleRedirectToRoot);
@@ -1309,19 +1639,24 @@ void setup() {
 
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
-  Serial.print("Modbus RTU slave ");
-  Serial.print(MODBUS_SLAVE_ID);
-  Serial.print(" ready: ");
-  Serial.print(RS485_BAUDRATE);
-  Serial.print(" 8N1, RX=GPIO");
-  Serial.print(RS485_RX_PIN);
-  Serial.print(", TX=GPIO");
-  Serial.print(RS485_TX_PIN);
-  Serial.print(", DE=");
-  Serial.println(RS485_DE_PIN);
+  Serial.print("Modbus TCP port: ");
+  Serial.println(MODBUS_TCP_PORT);
 }
 
 void loop() {
+  static IPAddress lastEthernetIp;
+  static bool lastEthernetLinkUp = false;
+  bool ethernetLinkUp = ETH.linkUp();
+  if (ethernetLinkUp != lastEthernetLinkUp) {
+    Serial.println(ethernetLinkUp ? "Ethernet: cable link up" : "Ethernet: cable link down");
+    lastEthernetLinkUp = ethernetLinkUp;
+  }
+  IPAddress ethernetIp = ETH.localIP();
+  if (ethernetIp != lastEthernetIp) {
+    Serial.print("Ethernet IP: ");
+    Serial.println(ethernetIp);
+    lastEthernetIp = ethernetIp;
+  }
   mb.task();
   dnsServer.processNextRequest();
 
@@ -1339,5 +1674,14 @@ void loop() {
   applyModbusWritableRegisters();
   syncModbusRegistersFromState();
   server.handleClient();
+  if (networkApplyPending && millis() - networkApplyRequestedAtMs >= 1000) {
+    networkApplyPending = false;
+    if (!applyEthernetSettings()) {
+      Serial.println("Ethernet: updated IP configuration failed");
+    } else {
+      Serial.print("Ethernet: updated IP mode: ");
+      Serial.println(networkSettings.useDhcp ? "DHCP" : "static");
+    }
+  }
   mb.task();
 }
